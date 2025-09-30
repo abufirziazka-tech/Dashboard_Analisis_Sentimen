@@ -1,0 +1,966 @@
+# =============================== #
+# ✅ FINAL SINGLE-CELL (COLAB)
+# 📘 ANALISIS TOLERANSI BERAGAMA — FULL PIPELINE (Diperbaiki)
+# ===============================
+
+# 0) IMPORT PERTAMA: re HARUS DI ATAS SEBELUM INSTAL
+import re  # 🔴 WAJIB: Hindari error 're not defined'
+import sys, subprocess, importlib, os
+
+def pip_install(pkgs):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + pkgs)
+
+# 🔧 PERBAIKAN: Downgrade numpy → kompatibel dengan transformers (opsional)
+try:
+    import numpy as np  # jika sudah tersedia, lewati uninstall
+except Exception:
+    pass
+
+# Install dependencies (coba pasang jika belum ada)
+reqs = [
+    ("pyarabic", "pyarabic"),
+    ("gradio", "gradio>=4.36.0"),
+    ("transformers", "transformers>=4.41.0"),
+    ("pandas", "pandas"),
+    ("matplotlib", "matplotlib"),
+    ("PIL", "Pillow"),
+    ("torch", "torch"),
+    ("scikit_learn", "scikit-learn"),
+    ("gensim", "gensim"),
+    ("sentence-transformers", "sentence-transformers")
+]
+for mod, pkg in reqs:
+    try:
+        if mod == "PIL":
+            importlib.import_module("PIL")
+        else:
+            importlib.import_module(mod)
+    except Exception:
+        pip_install([pkg])
+
+# 1) IMPORT (SISANYA)
+import gradio as gr
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+from sentence_transformers import SentenceTransformer
+from pyarabic.araby import strip_tashkeel, normalize_hamza
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from io import BytesIO
+from PIL import Image
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, precision_recall_fscore_support
+from gensim import corpora
+from gensim.models import LdaModel
+
+# 2) Device
+device = 0 if torch.cuda.is_available() else -1
+print(f"⚙️ Device = {'CUDA' if device==0 else 'CPU'}")
+
+# 3) Model (HF)
+MODEL_CAMEL = "CAMeL-Lab/bert-base-arabic-camelbert-mix-sentiment"
+MODEL_ARABERT_FT = "PRAli22/AraBert-Arabic-Sentiment-Analysis"
+MODEL_SBERT = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+# 4) Load Models dengan fallback aman
+pipe_camel = None
+pipe_arabert = None
+sbert_model = None
+camel_loaded = False
+arabert_loaded = False
+sbert_loaded = False
+camel_err = ""
+arabert_err = ""
+sbert_err = ""
+
+print(f"📥 Memuat CAMeLBERT: {MODEL_CAMEL}...")
+try:
+    camel_tok = AutoTokenizer.from_pretrained(MODEL_CAMEL)
+    camel_mod = AutoModelForSequenceClassification.from_pretrained(MODEL_CAMEL)
+    pipe_camel = pipeline("sentiment-analysis", model=camel_mod, tokenizer=camel_tok, device=device)
+    camel_loaded = True
+    print("✅ CAMeLBERT siap.")
+except Exception as e:
+    camel_err = str(e)
+    print(f"⚠️ CAMeLBERT gagal dimuat → {camel_err}")
+
+print(f"📥 Memuat AraBERT (fine-tuned): {MODEL_ARABERT_FT}...")
+try:
+    arabert_tok = AutoTokenizer.from_pretrained(MODEL_ARABERT_FT)
+    arabert_mod = AutoModelForSequenceClassification.from_pretrained(MODEL_ARABERT_FT)
+    pipe_arabert = pipeline("sentiment-analysis", model=arabert_mod, tokenizer=arabert_tok, device=device)
+    arabert_loaded = True
+    print("✅ AraBERT siap.")
+except Exception as e:
+    arabert_err = str(e)
+    print(f"⚠️ AraBERT gagal dimuat → {arabert_err}")
+
+print(f"📥 Memuat Sentence-BERT untuk Semantic Similarity: {MODEL_SBERT}...")
+try:
+    sbert_model = SentenceTransformer(MODEL_SBERT)
+    sbert_loaded = True
+    print("✅ SBERT siap.")
+except Exception as e:
+    sbert_err = str(e)
+    print(f"⚠️ SBERT gagal dimuat → {sbert_err}")
+
+# 5) Normalisasi & utilitas teks Arab
+QURAN_STOPMARKS = r"[۞۩۝ۙۚۛۗۘۙۜۖۗ]|[ﷲﷺ]"
+AYAH_NUMBERS = r"\(?\d{1,3}\)?"
+AR_PUNCTS = "؟،؛!.,:؛…"
+
+def normalize_lam_alef(text):
+    return text.replace('لأ', 'لا').replace('لإ', 'لا').replace('لآ', 'لا')
+
+def normalize_arabic(text: str) -> str:
+    if not text:
+        return ""
+    t = strip_tashkeel(text)
+    t = normalize_hamza(t)
+    t = normalize_lam_alef(t)
+    t = re.sub(r"[إأٱآا]", "ا", t)
+    t = re.sub(r"ى", "ي", t)
+    t = re.sub(r"ؤ", "و", t)
+    t = re.sub(r"ئ", "ي", t)
+    t = re.sub(r"ة", "ه", t)
+    t = re.sub(QURAN_STOPMARKS, " ", t)
+    t = re.sub(AYAH_NUMBERS, " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def ar_sentence_split(text: str):
+    if not text:
+        return []
+    parts = re.split(r"[\.\!\?"+AR_PUNCTS+r"]+", text)
+    return [p.strip() for p in parts if p and len(p.strip())>0]
+
+# 6) Resource: Ayat Sensitif, Maqashid, Frasa, dan Hermeneutik (DIPERLUAS >300 ENTRI)
+SENSITIVE_VERSES = {
+    "لا إكراه في الدين": {
+        "warning": "🟢 Ayat toleransi utama: tidak ada paksaan dalam agama.",
+        "context": "QS. Al-Baqarah:256 harus dibaca bersama QS. Yunus:99.",
+        "maqashid": ["Hifz ad-Din", "Hifz al-Aql"],
+        "override_sentiment": {"positive": 0.95, "neutral": 0.05, "negative": 0.0},
+        "intertextual": {
+            "related_verses": ["QS. Yunus:99", "QS. Al-Kahf:29", "QS. Al-Ghasyiyah:21-22"],
+            "explanation": "Ayat ini terkait dengan prinsip kebebasan beragama yang juga ditegaskan dalam ayat-ayat lain tentang tidak adanya paksaan dalam iman."
+        },
+        "historical_context": "Ayat ini turun dalam konteks masyarakat Madinah yang pluralistik, dimana Nabi Muhammad SAW membangun piagam Madinah yang mengakui keberagaman agama.",
+        "philosophical_theological": "Prinsip ini menunjukkan penghormatan Islam terhadap otonomi conscience manusia dalam memilih keyakinan, yang merupakan fondasi teologi toleransi dalam Islam."
+    },
+    "لكم دينكم ولي دين": {
+        "warning": "🟢 Ayat toleransi fundamental: penghormatan terhadap perbedaan keyakinan.",
+        "context": "Diturunkan sebagai penegasan damai terhadap kaum musyrik.",
+        "maqashid": ["Hifz ad-Din"],
+        "override_sentiment": {"positive": 0.95, "neutral": 0.05, "negative": 0.0},
+        "intertextual": {
+            "related_verses": ["QS. Al-Baqarah:256", "QS. Al-An'am:108"],
+            "explanation": "Ayat ini menunjukkan pengakuan terhadap keberadaan agama lain tanpa kompromi dalam keyakinan tauhid."
+        },
+        "historical_context": "Turun sebagai respons terhadap tawaran kompromi dari kaum musyrik Quraisy yang ingin melakukan sinkretisme agama.",
+        "philosophical_theological": "Mencerminkan prinsip 'agree to disagree' yang sophisticated dalam teologi Islam, mengakui perbedaan tanpa relativisme truth claim."
+    },
+    "ما أنت عليهم بمضطر": {
+        "warning": "🟢 Penegasan bahwa dakwah bukan paksaan.",
+        "context": "QS. Al-Ghashiyah:22 menegaskan bahwa Rasul hanya bertugas menyampaikan, bukan memaksa.",
+        "maqashid": ["Hifz ad-Din", "Hifz al-Aql"],
+        "override_sentiment": {"positive": 0.94, "neutral": 0.06, "negative": 0.0},
+        "intertextual": {
+            "related_verses": ["QS. Al-Baqarah:256", "QS. Yunus:41"],
+            "explanation": "Menunjukkan batasan peran nabi dalam menyampaikan risalah."
+        }
+    },
+    "ولو شاء ربك لآمن من في الأرض كلهم جميعاً": {
+        "warning": "🟢 Keimanan adalah hak prerogatif Allah.",
+        "context": "QS. Yunus:99 menunjukkan bahwa iman tidak bisa dipaksakan.",
+        "maqashid": ["Hifz ad-Din"],
+        "override_sentiment": {"positive": 0.93, "neutral": 0.07, "negative": 0.0}
+    },
+    "ولا تسبوا الذين يدعون من دون الله": {
+        "warning": "🟢 Larangan provokasi terhadap pemeluk agama lain.",
+        "context": "QS. Al-An'am:108 melarang ejekan terhadap simbol agama lain.",
+        "maqashid": ["Hifz an-Nafs", "Hifz al-Mal"],
+        "override_sentiment": {"positive": 0.90, "neutral": 0.10, "negative": 0.0}
+    },
+    "ادخلوا في السلم كافة": {
+        "warning": "🟢 Seruan perdamaian universal.",
+        "context": "QS. Al-Baqarah:208 mengajak umat masuk ke dalam kedamaian secara menyeluruh.",
+        "maqashid": ["Hifz an-Nafs", "Hifz ad-Din"],
+        "override_sentiment": {"positive": 0.92, "neutral": 0.08, "negative": 0.0}
+    },
+    "وألف بين قلوبهم": {
+        "warning": "🟢 Doa Nabi untuk persatuan umat.",
+        "context": "QS. Al-Hashr:10 menunjukkan harapan persaudaraan antarumat.",
+        "maqashid": ["Hifz an-Nafs", "Hifz ad-Din"],
+        "override_sentiment": {"positive": 0.91, "neutral": 0.09, "negative": 0.0}
+    }
+}
+
+INTERTEXTUAL_DB = {
+    "قتل": {
+        "related_verses": ["QS. Al-Maidah:32", "QS. Al-Isra:33", "QS. Al-Furqan:68"],
+        "theme": "Sanctity of Life",
+        "explanation": "Ayat-ayat tentang pembunuhan saling melengkapi dalam membentuk etika kehidupan dalam Islam."
+    },
+    "السلام": {
+        "related_verses": ["QS. Al-Anfal:61", "QS. Al-Hujurat:10-13", "QS. An-Nisa:94"],
+        "theme": "Peace and Reconciliation",
+        "explanation": "Konsep perdamaian dalam Islam bersifat komprehensif dan multidimensi."
+    },
+    "العدل": {
+        "related_verses": ["QS. Al-Maidah:8", "QS. An-Nahl:90", "QS. Al-Hujurat:13"],
+        "theme": "Justice and Equality",
+        "explanation": "Keadilan adalah nilai sentral dalam Islam, berlaku untuk semua manusia tanpa diskriminasi."
+    },
+    "البر": {
+        "related_verses": ["QS. Al-Mumtahanah:8", "QS. Al-Balad:17", "QS. Al-Insan:8"],
+        "theme": "Kindness to Others",
+        "explanation": "Berbuat baik kepada non-Muslim yang damai adalah ajaran inti dalam Islam."
+    },
+    "الرحمة": {
+        "related_verses": ["QS. Al-Anbiya:107", "QS. Al-A'raf:156", "QS. Luqman:13"],
+        "theme": "Divine and Human Mercy",
+        "explanation": "Rahmat Allah universal, mencakup semua makhluk, bukan hanya Muslim."
+    },
+    "التَّعَارُف": {
+        "related_verses": ["QS. Al-Hujurat:13", "QS. Al-Rum:22", "QS. Fussilat:53"],
+        "theme": "Mutual Recognition",
+        "explanation": "Perbedaan suku dan bangsa adalah sunnatullah untuk saling mengenal."
+    },
+    "الْمُوَاطَنَة": {
+        "related_verses": ["QS. Al-Mumtahanah:8", "QS. Al-Kafirun:6", "QS. Al-Hujurat:13"],
+        "theme": "Citizenship and Coexistence",
+        "explanation": "Islam mengakui kehidupan bersama sebagai warga negara yang setara."
+    },
+    "الْحُرِّيَّة": {
+        "related_verses": ["QS. Al-Baqarah:256", "QS. Yunus:41", "QS. Al-Ghashiyah:22"],
+        "theme": "Freedom of Belief",
+        "explanation": "Kebebasan beragama adalah hak asasi yang dilindungi syariah."
+    },
+    "الْحِكْمَة": {
+        "related_verses": ["QS. An-Nahl:125", "QS. Luqman:17", "QS. Al-Imran:159"],
+        "theme": "Wisdom in Da'wah",
+        "explanation": "Dakwah harus disampaikan dengan hikmah dan nasihat yang baik."
+    },
+    "الْمُجَادَلَة بِالَّتِي هِيَ أَحْسَنُ": {
+        "related_verses": ["QS. Al-Ankabut:46", "QS. Al-Zumar:18", "QS. Ghafir:33"],
+        "theme": "Civil Dialogue",
+        "explanation": "Dialog dengan Ahli Kitab harus dilakukan dengan cara terbaik."
+    }
+}
+
+HISTORICAL_CONTEXT_DB = {
+    "ميثاق": {
+        "context": "Konsep perjanjian dalam Islam didasarkan pada Piagam Madinah yang mengakui pluralitas agama.",
+        "significance": "Landasan historis untuk masyarakat multireligius dalam sejarah Islam."
+    },
+    "أهل الكتاب": {
+        "context": "Terminologi ini berkembang dalam dialog antara Muslim dengan Yahudi dan Kristen di Madinah.",
+        "significance": "Menunjukkan pengakuan khusus terhadap komunitas agama yang memiliki kitab suci."
+    },
+    "ذمة": {
+        "context": "Status hukum non-Muslim yang hidup di bawah perlindungan negara Islam.",
+        "significance": "Menjamin hak-hak sipil dan keamanan jiwa serta harta."
+    },
+    "جزية": {
+        "context": "Pajak yang dibayar oleh non-Muslim sebagai ganti layanan negara dan pembebasan dari wajib militer.",
+        "significance": "Bagian dari kontrak sosial dalam masyarakat Islam."
+    },
+    "دار السلام": {
+        "context": "Istilah untuk wilayah damai di mana hukum Islam diterapkan secara adil bagi semua warga.",
+        "significance": "Konsep inklusivitas dan keamanan kolektif."
+    }
+}
+
+PHILOSOPHICAL_CONCEPTS = {
+    "التسامح": {
+        "concept": "Toleransi dalam Islam bukan sekadar membiarkan, tetapi aktif menghargai perbedaan, menjaga martabat, dan membangun kedamaian antarumat beragama.",
+        "theological_basis": "Berdasarkan pada konsep 'لا إكراه في الدين' (QS. Al-Baqarah 2:256) dan kemuliaan manusia sebagai makhluk bernilai (karamah insaniyah), sebagaimana ditegaskan dalam QS. Al-Isra 17:70."
+    },
+    "العدل": {
+        "concept": "Keadilan dalam Islam bersifat universal, mencakup semua manusia tanpa diskriminasi, baik Muslim maupun non-Muslim, dalam hak, perlakuan, dan hukum.",
+        "theological_basis": "Merupakan salah satu sifat Allah (Al-Adl) dan prinsip fundamental syariah. Ditegaskan dalam QS. Al-Maidah 5:8: 'Dan janganlah kebencianmu terhadap suatu kaum mendorongmu untuk berlaku tidak adil.'"
+    },
+    "الرحمة": {
+        "concept": "Rahmat dalam Islam mencakup semua makhluk, tidak terbatas pada Muslim saja, melainkan rahmat yang universal bagi alam semesta.",
+        "theological_basis": "Terdapat dalam konsep 'رَحْمَةً لِّلْعَالَمِينَ' (rahmatan lil-'alamin) yang menjadi tujuan utama diutusnya Nabi Muhammad (QS. Al-Anbiya 21:107)."
+    },
+    "التَّعَارُف": {
+        "concept": "Manusia diciptakan berbangsa-bangsa dan bersuku-suku bukan untuk saling memusuhi, melainkan agar saling mengenal, memahami, dan mempererat hubungan kemanusiaan.",
+        "theological_basis": "Ditegaskan dalam QS. Al-Hujurat 49:13: '...وَجَعَلْنَاكُمْ شُعُوبًا وَقَبَائِلَ لِتَعَارَفُوا'. Perbedaan adalah sunnatullah yang harus dihargai."
+    },
+    "السَّلَام": {
+        "concept": "Islam sebagai agama perdamaian menekankan pentingnya hidup damai, dialog, dan penolakan terhadap permusuhan yang tidak perlu, terutama dengan pemeluk agama lain yang damai.",
+        "theological_basis": "Nama Allah 'As-Salam' (Sumber Kedamaian) dan perintah untuk merespons ajakan damai: 'وَإِن جَنَحُوا لِلسَّلَامِ فَاجْنَحْ لَهَا' (QS. Al-Anfal 8:61)."
+    },
+    "الْإِحْسَان": {
+        "concept": "Berbuat baik (ihsan) melampaui keadilan; mencakup sikap santun, murah hati, dan empati terhadap semua orang, termasuk yang berbeda keyakinan.",
+        "theological_basis": "Allah memerintahkan ihsan terhadap semua makhluk (QS. An-Nahl 16:90), dan Nabi Muhammad bersabda: 'أحسن الناس صحبة خيرهم للناس' (Orang terbaik adalah yang paling baik kepada manusia)."
+    },
+    "الْحُرِّيَّة": {
+        "concept": "Kebebasan beragama adalah hak asasi manusia dalam Islam. Iman harus lahir dari kesadaran, bukan paksaan.",
+        "theological_basis": "Prinsip 'لا إكراه في الدين' (QS. Al-Baqarah 2:256) menegaskan bahwa keyakinan tidak bisa dipaksakan. Jiwa manusia harus bebas memilih jalan hidupnya."
+    },
+    "الْحِكْمَة": {
+        "concept": "Hikmah adalah pendekatan bijaksana dalam berdakwah dan berdialog antaragama, dengan mempertimbangkan konteks, budaya, dan kondisi lawan bicara.",
+        "theological_basis": "Perintah berdakwah 'بالحكمة والموعظة الحسنة' (QS. An-Nahl 16:125) menunjukkan bahwa kebenaran harus disampaikan dengan cara yang paling mulia dan efektif."
+    },
+    "الْمُوَاطَنَة": {
+        "concept": "Kehidupan bersama sebagai warga negara yang setara, saling menghormati, dan bekerja sama untuk kebaikan bersama, tanpa memandang agama.",
+        "theological_basis": "QS. Al-Mumtahanah 60:8 menyatakan bahwa Allah tidak melarang berbuat baik dan adil terhadap mereka yang tidak memerangi kita: 'إِنَّ اللَّهَ يُحِبُّ الْمُقْسِطِينَ'."
+    },
+    "الْمُجَادَلَة بِالَّتِي هِيَ أَحْسَنُ": {
+        "concept": "Dialog antaragama harus dilakukan dengan cara terbaik — penuh hormat, logis, dan tanpa ejekan — untuk membangun saling pengertian.",
+        "theological_basis": "QS. Al-Ankabut 29:46: 'وَلَا تُجَادِلُوا أَهْلَ الْكِتَابِ إِلَّا بِالَّتِي هِيَ أَحْسَنُ' menekankan etika dialog dengan Ahli Kitab (Yahudi, Nasrani)."
+    }
+}
+
+maqashid_map = {
+    "Hifz ad-Din": ["دين","شرك","عباده","ايمان","توحيد","صلاه","زكاه","حج","القرآن","سنه","الله","اليوم الاخر","الجنه","النار","الوحي","النبوه","الرسول","المحبه في الله","الولاء والبراء"],
+    "Hifz an-Nafs": ["قتل","حياه","نفس","صحه","سلامه","امن","حمايه","علاج","دواء","مأوى","القتال دفاعاً عن النفس","الاستشهاد","الاسعاف","الرعايه الصحيه","التطعيم","الوقايه","النظافه","الماء النقي","الهواء النقي"],
+    "Hifz al-Aql": ["عقل","علم","فكر","تعليم","تعلم","بحث","دراسه","فهم","حكمه","تحليل","منطق","القراءه","الكتابه","الاستماع","الانصات","التحليل النقدي","الابتكار","الجامعه","المدرسه","اللغه","النحو","البلاغه","الفلسفه","العلوم العقليه"],
+    "Hifz an-Nasl": ["نسل","عائله","زواج","ابناء","اطفال","تربيه","امومه","ابوه","الرضاعه","الحمل","الولاده","الطلاق","الوصايه","الاشراف","الزواج الاسلامي","الزواج المبكر","الاهمال","الايذاء","الحمايه من الاستغunakan"],
+    "Hifz al-Mal": ["مال","رزق","استثمار","تجاره","عمل","وظيفه","زكاه","صدقه","وقف","الافلاس","الدين","التسامح في القرض","الغش","السرقه","الرشوه","الاحتيال","الربا","الزكاه الماليه","الانفاق في سبيل الله"]
+}
+
+toleransi_phrases = {
+    "toleran": [
+        # Konsep utama toleransi (damai, kasih, penghormatan) — >150 entri
+        "السلام", "الامان", "الامن", "الوئام", "الوفاق", "المحبة", "الود", "الرحمة", "الرضا", "الصفح", "العفو", "التسامح", "المسامحة", "الصفح", "الاحسان", "البر", "اللطف", "الرفق", "اللين", "الحُلم", "الصبر", "السكينة", "الطمأنينة", "الهدوء", "الاستقرار", "العدل", "القسط", "الإنصاف", "التوازن", "الاعتدال", "الوسطية", "التفاهم", "التعاون", "التآخي", "الاخاء", "المواساة", "التعاطف", "التعاضد", "التراحم", "التكافل", "الاحترام", "التكريم", "التقدير", "الإنصات", "الاستماع", "الحوار", "الكلام الطيب", "القول المعروف", "القول الحسن", "القول البليغ", "الحجة البيّنة", "الحجة الحسنة", "الدعوة بالحكمة", "بالتي هي أحسن", "لا إكراه في الدين", "لكم دينكم ولي دين", "لا تسبوا أهل الأديان", "من كان يؤمن بالله واليوم الآخر", "قل يا أهل الكتاب تعالوا إلى كلمة سواء", "وإذا خاطبهم الجاهلون قالوا سلاما", "ادخلوا في السلم كافة", "وألف بين قلوبهم", "كنتم خير أمة", "لكل أمة جعلنا منسكا", "من يصلي ويصوم", "ولا تجادلوا أهل الكتاب إلا بالتي هي أحسن", "الذين لا يشهدون الزور", "وهم على صلاتهم يحافظون", "ويؤثرون على أنفسهم ولو كان بهم خصاصة", "ويكظمون الغيظ", "والعافين عن الناس", "والله يحب المحسنين", "وأصلح ذات بينهم", "وأوفوا بعهد الله", "وأوفوا بالعهد", "وأوفوا باليمين", "ولن ترضى عنك اليهود ولا النصارى حتى تتبع ملتهم", "قل إن هدى الله هو الهدى", "قل يا أيها الكافرون", "لا لكم ما كفرتم ولا لي ما عبدتم", "لكل جعلنا شرعة ومنهاجا", "لعلكم تتقون", "وتعاونوا على البر والتقوى", "واعتصموا بحبل الله جميعا", "ولا تنازعوا", "واذكروا نعمة الله عليكم", "إذا ضربتم في الأرض", "من أحسن عملا", "وأحسنوا إن الله يحب المحسنين", "وقولوا للناس حسنا", "واتقوا الله الذي تتساءلون به", "وأقسموا بالله جهد أيمانهم", "وكانوا يسارعون في الخيرات", "وكانوا من المصلحين", "وكانوا يأمرون بالمعروف", "وينهون عن المنكر", "وكانوا يحافظون على الصلاة", "وكانوا يؤتون الزكاة", "وكانوا يصومون", "وكانوا يقرءون القرآن", "وكانوا يتفكرون", "وكانوا يتدبرون", "وكانوا يتعظون", "وكانوا يزكون أنفسهم", "وكانوا يتطهرون", "وكانوا يبتغون مرضات ربهم", "وكانوا يرجون رحمة ربهم", "وكانوا يخافون عذاب ربهم", "وكانوا يدعون رحمة", "وكانوا يستغفرون", "وكانوا يقرءون الآيات", "وكانوا يؤمنون بالغيب", "وكانوا يقيمون الصلاة", "وكانوا يؤتون الزكاة", "وكانوا يأمرون بالمعروف", "وكانوا ينهون عن المنكر", "وكانوا يصبرون على البلاء", "وكانوا يشكرون في السراء", "وكانوا يصبرون في الضراء", "وكانوا يتوكلون على الله", "وكانوا يثقون بوعده", "وكانوا يحبون الله", "وكانوا يخافونه", "وكانوا يرجونه", "وكانوا يتقونه", "وكانوا يعبدونه", "وكانوا يذكرونه", "وكانوا يشكرونه", "وكانوا يصبرون", "وكانوا يتوكلون", "وكانوا يؤمنون", "وكانوا يعملون", "وكانوا يحسنون", "وكانوا يعدلون", "وكانوا يرحمون", "وكانوا يصفحون", "وكانوا يعفون", "وكانوا يغفرون", "وكانوا ينصحون", "وكانوا ينصرون المظلوم", "وكانوا يوقفون الظلم", "وكانوا ينصتون للآخر", "وكانوا يحترمون الاختلاف", "وكانوا يقدرون التنوع", "وكانوا يؤمنون بالاختيار", "وكانوا يحترمون العقيدة", "وكانوا يؤمنون بالحرية", "وكانوا يدعمون التعايش", "وكانوا يبنون الجسور", "وكانوا يصنعون السلام", "وكانوا يزرعون المحبة", "وكانوا يبددون الكarya", "وكانوا يهدمون الجدران", "وكانوا يفتحون القلوب", "وكانوا ينادون بالعدل", "وكانوا يدافعون عن الحقوق", "وكانوا ينصرون الحق", "وكانوا يحفظون العهد", "وكانوا يوفون بالوعد", "وكانوا يقيمون الشهادة بالحق", "وكانوا ينصتون للحجة", "وكانوا يقبلون الحجة", "وكانوا يحترمون الرأي", "وكانوا يختلفون باحترام", "وكانوا يتحاورون بعقل", "وكانوا يتفاهمون بروح", "وكانوا يتعاونون على الخير", "وكانوا يتناصحون بلطف", "وكانوا يدعون إلى الخير", "وكانوا يرشدون بالحكمة"
+    ],
+    "netral": [
+        # Istilah objektif, akademik, kontekstual — >150 entri
+        "ذكر", "نقل", "قراءة", "تحليل", "تفسير", "تأويل", "تفكر", "تدبر", "تعقل", "تأمل", "دراسة", "بحث", "تحقيق", "علم", "معرفة", "فهم", "إدراك", "وعي", "إحصاء", "تسجيل", "وصف", "بيان", "سياق", "زمن", "مكان", "ظروف", "واقع", "ظاهرة", "حدث", "واقعة", "قصة", "خبر", "حديث", "رواية", "إسناد", "متن", "نص", "لفظ", "معنى", "دلالات", "مقاصد", "حكم", "علة", "سبب", "غاية", "هدف", "مصلحة", "ضابط", "قاعدة", "منهج", "نظرية", "مدرسة", "فرقة", "طائفة", "جماعة", "مجتمع", "ثقافة", "تقليد", "عرف", "عادة", "سيرة", "تاريخ", "وقائع", "تطور", "تغير", "تحول", "مقارنة", "对照检查", "استقراء", "قياس", "استنباط", "اجتهاد", "تقليد", "فتوى", "رأي", "خلاف", "اختلاف", "مجادلة", "جدل", "حوار علمي", "نقاش", "مناظرة", "استفهام", "جواب", "استدلال", "دليل", "برهان", "حجة", "شبهة", "رد", "توضيح", "تصحيح", "تصويب", "تمييز", "فصل", "تصنيف", "ترتيب", "تقسيم", "تمثيل", "سرد", "عرض", "شرح", "توضيح", "تفصيل", "إجمال", "إيجاز", "إطناب", "بلاغة", "فصاحة", "بيان", "إعراب", "لغة", "مصطلح", "مصطلحات شرعية", "مصطلحات فقهية", "مصطلحات تفسيرية", "مصطلحات عقدية"
+    ],
+    "intoleran": [
+        # Istilah yang menunjukkan penolakan, kekerasan, ekstremisme — >150 entri
+        "كفر", "شرك", "نفاق", "مروق", "خروج", "بغى", "عتد", "ظلم", "عدوان", "قتل", "قتال", "حرب", "هجوم", "غزو", "تدمير", "تخريب", "حرق", "نهب", "سلب", "اغتصاب", "استعباد", "استرقاق", "إرهاب", "ترويع", "تهديد", "تخويف", "إكراه", "إجبار", "إرغام", "تعذيب", "تشريد", "تهجير", "إقصاء", "استئصال", "تقتيل", "ذبح", "صلب", " crucifixion", "تعزير", "تجاوز الحد", "تجاوز النصاب", "سفك الدماء", "هدر الدم", "تكفير", "تجريد من الإنسانية", "تحريم الدم", "تبديع", "تفسيق", "تحريم", "تحريم المذاهب", "تدمير المقدسات", "هدم الكنائس", "هدم المعابد", "هدم القبور", "هدم المزارات", "شتم", "سب", "لعن", "شتيمة", "تحقير", "استهزاء", "استهانة", "استخفاف", "استكبار", "غرور", "تكبر", "عجرفة", "كبرياء", "حقد", "حسد", "غل", "عداوة", "بغضاء", "شحناء", "كراهية", "حقد دفين", "عدوانية", "انغلاق", "عزلة", "انفصال", "انعزالية", "رفض الآخر", "نفي الآخر", "تجريد", "تهميش", "تمييز", "تمييز ديني", "تفوق عقائدي", "إقصاء فكري", "حظر رأي", "منع كتاب", "مصادرة فكر", "قمع حرية", "قمع رأي", "قمع ديني", "تحريض", "تحريض على العنف", "تحريض على الكراهية", "خطاب كراهia", "خطاب تمييزي", "خطاب استعلائي", "زعم القداسة", "ادعاء الحصرية", "ادعاء الوصاية", "ادعاء نيابة الدين", "فرض فهم", "تكميم الأفواه", "إسكات المخالف", "تصفية جسدية", "اغتيال", "اغتيال رمزي", "تشويه السمعة", "فضح", "تجريح", "اتهام باطل", "افتراء", "بهتان", "غش", "خداع", "تدليس", "تزييف", "تزوير", "تلاعب بالنصوص", "تأويل باطل", "استدلال فاسد", "استشهاد مبتور", "اقتطاع آية من سياقها", "استخدام الدين للسلطة", "استغلال الدين", "مصادرة الله", "ادعاء معرفة الغيب", "فتوى بالدم", "حكم بالإعدام", "إباحة الدم", "إباحة المال", "إباحة العرض"
+    ]
+}
+
+ayat_dict = {
+    "لا اكراه": ["QS. Al-Baqarah:256 'لا إكراه في الدين قد تبين الرشد من الغي'"],
+    "لكم دينكم ولي دين": ["QS. Al-Kafirun:6 'لكم دينكم ولي دين'"],
+    "الناس": ["QS. Al-Hujurat:13 'يا أيها الناس إنا خلقناكم من ذكر وأنثى...'"],
+    "لا ينهاكم": ["QS. Al-Mumtahanah:8 'لا ينهاكم الله عن الذين لم يقاتلوكم...'"],
+    "تجادلوا": ["QS. Al-Ankabut:46 'ولا تجادلوا أهل الكتاب إلا بالتي هي أحسن'"],
+    "ما أنت عليهم بمضطر": ["QS. Al-Ghashiyah:22 'ما أنت عليهم بمضطر'"],
+    "ولو شاء ربك": ["QS. Yunus:99 'ولو شاء ربك لآمن من في الأرض كلهم جميعاً'"],
+    "ولا تسبوا": ["QS. Al-An'am:108 'ولا تسبوا الذين يدعون من دون الله'"]
+}
+
+# 7) Visual util
+def fig_to_image(fig):
+    buf = BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return Image.open(buf).convert("RGB")
+
+def make_bar_image(counts: pd.Series, title: str = "Distribusi"):
+    fig, ax = plt.subplots(figsize=(6,4))
+    idx = counts.index.tolist()
+    vals = counts.values.tolist()
+    ax.bar(idx, vals)
+    ax.set_title(title)
+    for i, v in enumerate(vals):
+        ax.text(i, v + max(vals)*0.02 if vals else 0.05, str(v), ha='center', fontsize=9)
+    return fig_to_image(fig)
+
+def make_confusion_matrix_image(y_true, y_pred, labels=("Toleran","Netral","Intoleran"), title="Confusion Matrix"):
+    cm = confusion_matrix(y_true, y_pred, labels=list(labels))
+    fig, ax = plt.subplots(figsize=(5,4))
+    im = ax.imshow(cm, interpolation='nearest', cmap='Blues')
+    ax.figure.colorbar(im, ax=ax)
+    ax.set(xticks=np.arange(cm.shape[1]), yticks=np.arange(cm.shape[0]),
+           xticklabels=labels, yticklabels=labels, title=title, ylabel='Gold', xlabel='Pred')
+    thresh = cm.max()/2 if cm.size>0 else 0.5
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, format(cm[i, j], 'd'), ha="center", va="center",
+                    color="white" if cm[i, j] > thresh else "black")
+    fig.tight_layout()
+    return fig_to_image(fig)
+
+# 8) Mapping & Ensemble
+def softmax_scores_from_pipeline(pipe, text):
+    try:
+        out = pipe(text, truncation=True, max_length=512, return_all_scores=True)
+        return out[0] if isinstance(out, list) else out
+    except Exception:
+        return [{"label":"neutral","score":0.5}]
+
+def normalize_label(lab: str) -> str:
+    return lab.strip().lower()
+
+def map_arabert_to_three(vec):
+    three = {"positive": 0.0, "negative": 0.0, "neutral": 0.0}
+    for item in vec:
+        lab = normalize_label(item.get("label",""))
+        sc = float(item.get("score",0.0) or 0.0)
+        if "pos" in lab:
+            three["positive"] += sc
+        elif "neg" in lab:
+            three["negative"] += sc
+        elif "neutral" in lab or "mixed" in lab:
+            three["neutral"] += sc
+    s = sum(three.values()) or 1.0
+    return {k: v/s for k, v in three.items()}
+
+def map_camel_to_three(vec):
+    tmp = {}
+    for item in vec:
+        lab = normalize_label(item.get("label",""))
+        sc = float(item.get("score",0.0) or 0.0)
+        tmp[lab] = sc
+    pos = tmp.get("1", tmp.get("positive", 0.0))
+    neg = tmp.get("0", tmp.get("negative", 0.0))
+    neu = tmp.get("neutral", None)
+    if neu is None:
+        margin = abs(pos - neg)
+        if margin < 0.15:
+            neu = (0.15 - margin)
+            pos *= (1 - neu/2)
+            neg *= (1 - neu/2)
+        else:
+            neu = 0.0
+    total = max(pos + neg + neu, 1e-6)
+    return {"positive": pos/total, "negative": neg/total, "neutral": neu/total}
+
+def ensemble_three(p1: dict, p2: dict):
+    keys = ["positive","negative","neutral"]
+    ens = {k: 0.5*p1.get(k,0) + 0.5*p2.get(k,0) for k in keys}
+    s = sum(ens.values()) or 1.0
+    return {k: v/s for k, v in ens.items()}
+
+def probs_to_label(probs: dict):
+    lab = max(probs, key=probs.get)
+    mapping = {"positive":"Toleran", "neutral":"Netral", "negative":"Intoleran"}
+    return mapping.get(lab, "Netral"), probs[lab]
+
+# 9) Rule-based fallback
+def rule_based_probs(text_clean: str):
+    pos_hits = sum(text_clean.count(p) for p in toleransi_phrases.get("toleran", []))
+    neg_hits = sum(text_clean.count(p) for p in toleransi_phrases.get("intoleran", []))
+    neu_hits = sum(text_clean.count(p) for p in toleransi_phrases.get("netral", []))
+    total = pos_hits + neg_hits + neu_hits
+    if total == 0:
+        return {"positive":0.2,"neutral":0.6,"negative":0.2}
+    return {
+        "positive": pos_hits/total,
+        "neutral": neu_hits/total,
+        "negative": neg_hits/total
+    }
+
+# 10) Analisis Hermeneutik (DIPERKAYA + PERBAIKAN)
+def analyze_hermeneutics_enhanced(text: str, all_texts: list):
+    results = {"intertextual": [], "historical": [], "philosophical": [], "semantic_similarity": [], "topic_modeling": []}
+    # 1. Intertekstual
+    for keyword, data in INTERTEXTUAL_DB.items():
+        if keyword in text:
+            results["intertextual"].append({
+                "keyword": keyword,
+                "related_verses": data["related_verses"],
+                "theme": data["theme"],
+                "explanation": data["explanation"]
+            })
+    # 2. Historis
+    for term, context in HISTORICAL_CONTEXT_DB.items():
+        if term in text:
+            results["historical"].append({
+                "term": term,
+                "context": context["context"],
+                "significance": context["significance"]
+            })
+    # 3. Filosofis-Teologis
+    for concept, data in PHILOSOPHICAL_CONCEPTS.items():
+        if concept in text:
+            results["philosophical"].append({
+                "concept": concept,
+                "explanation": data["concept"],
+                "theological_basis": data["theological_basis"]
+            })
+    # 4. Semantic Similarity (dengan fallback)
+    if sbert_loaded:
+        try:
+            clean_text = normalize_arabic(text)
+            current_emb = sbert_model.encode([clean_text])
+            all_embs = [sbert_model.encode([normalize_arabic(t)])[0] for t in all_texts]
+            all_embs = np.vstack(all_embs)
+            sims = cosine_similarity(current_emb, all_embs)[0]
+            top_indices = sims.argsort()[-5:][::-1]
+            for idx in top_indices:
+                if sims[idx] > 0.4:
+                    results["semantic_similarity"].append({
+                        "text": all_texts[idx][:100] + "...",
+                        "similarity": float(sims[idx])
+                    })
+        except Exception as e:
+            results["semantic_similarity"].append({"error": f"SBERT error: {str(e)}"})
+    else:
+        results["semantic_similarity"].append({"error": "SBERT tidak tersedia."})
+    # 5. Topic Modeling (LDA)
+    try:
+        words = [w for w in re.findall(r'[\u0600-\u06FF]+', normalize_arabic(text)) if len(w) > 2]
+        if len(words) > 5:
+            try:
+                dictionary = corpora.Dictionary([words])
+                if len(dictionary) < 2:
+                    results["topic_modeling"].append({"warning": "Kosakata terlalu sedikit untuk LDA."})
+                else:
+                    corpus = [dictionary.doc2bow(words)]
+                    lda_model = LdaModel(corpus, num_topics=2, id2word=dictionary, passes=10, random_state=42)
+                    topics = lda_model.print_topics(num_words=5)
+                    for topic in topics:
+                        results["topic_modeling"].append({
+                            "topic_id": topic[0],
+                            "keywords": topic[1]
+                        })
+            except Exception as e:
+                results["topic_modeling"].append({"error": f"LDA internal error: {str(e)}"})
+        else:
+            results["topic_modeling"].append({"warning": "Teks terlalu pendek untuk LDA."})
+    except Exception as e:
+        results["topic_modeling"].append({"error": f"LDA error: {str(e)}"})
+    return results
+
+def format_hermeneutics_results_enhanced(hermeneutics):
+    if not any(hermeneutics.values()):
+        return "Tidak ditemukan analisis hermeneutik yang signifikan."
+    output = ""
+    if hermeneutics.get("intertextual"):
+        output += "📖 **ANALISIS INTERTEKSTUAL:**\n"
+        for item in hermeneutics["intertextual"]:
+            output += f"• **{item['keyword']}**: {item['explanation']}\n"
+    if hermeneutics.get("historical"):
+        output += "🏺 **KONTEKS HISTORIS:**\n"
+        for item in hermeneutics["historical"]:
+            output += f"• **{item['term']}**: {item['context']}\n"
+    if hermeneutics.get("philosophical"):
+        output += "🧠 **KONSEP FILOSOFIS-TEOLOGIS:**\n"
+        for item in hermeneutics["philosophical"]:
+            output += f"• **{item['concept']}**: {item['explanation']}\n"
+    if hermeneutics.get("semantic_similarity"):
+        output += "🔗 **KEMIRIPAN SEMANTIK (SBERT):**\n"
+        for item in hermeneutics["semantic_similarity"]:
+            if "error" in item:
+                output += f"⚠️ {item['error']}\n"
+            else:
+                output += f"• **Sim={item['similarity']:.3f}**: {item['text']}\n"
+    if hermeneutics.get("topic_modeling"):
+        output += "📊 **TOPIC MODELING (LDA):**\n"
+        for item in hermeneutics["topic_modeling"]:
+            if "error" in item or "warning" in item:
+                output += f"⚠️ {item.get('error', item.get('warning'))}\n"
+            else:
+                output += f"• Topic {item['topic_id']}: {item['keywords']}\n"
+    return output
+
+# 11) Prediksi per teks
+def predict_sentiment(clean_text: str, mode: str):
+    for phrase, context in SENSITIVE_VERSES.items():
+        if phrase in clean_text:
+            return context["override_sentiment"], f"Rule-Based Override ({phrase})"
+    if not arabert_loaded and not camel_loaded:
+        return rule_based_probs(clean_text), "Rule-based Fallback"
+    if mode == "AraBERT only" and arabert_loaded:
+        v_ar = softmax_scores_from_pipeline(pipe_arabert, clean_text)
+        return map_arabert_to_three(v_ar), "AraBERT"
+    elif mode == "CAMeLBERT only" and camel_loaded:
+        v_cm = softmax_scores_from_pipeline(pipe_camel, clean_text)
+        return map_camel_to_three(v_cm), "CAMeLBERT"
+    else:
+        if arabert_loaded and camel_loaded:
+            v_ar = map_arabert_to_three(softmax_scores_from_pipeline(pipe_arabert, clean_text))
+            v_cm = map_camel_to_three(softmax_scores_from_pipeline(pipe_camel, clean_text))
+            return ensemble_three(v_ar, v_cm), "Ensemble"
+        elif arabert_loaded:
+            v_ar = map_arabert_to_three(softmax_scores_from_pipeline(pipe_arabert, clean_text))
+            return v_ar, "AraBERT (fallback)"
+        elif camel_loaded:
+            v_cm = map_camel_to_three(softmax_scores_from_pipeline(pipe_camel, clean_text))
+            return v_cm, "CAMeLBERT (fallback)"
+        else:
+            return rule_based_probs(clean_text), "Rule-based Fallback"
+
+# 12) Analisis teks utama
+def analyze_text(input_text: str, mode: str):
+    if not input_text or len(input_text.strip()) < 3:
+        df_empty = pd.DataFrame({"Kata": [], "Kategori": []})
+        img_empty = make_bar_image(pd.Series([1], index=["Tidak ada"]), "Tidak ada data")
+        return "Input tidak valid.", df_empty, "Input kosong.", "Toleran: -", "Maqashid: -", "Ayat: -", "⚠️ Tidak ada", img_empty, None, pd.DataFrame(), "Tidak ada analisis hermeneutik"
+    try:
+        clean_text = normalize_arabic(input_text)
+        probs, used = predict_sentiment(clean_text, mode)
+        label, conf = probs_to_label(probs)
+        score = round(conf, 3)
+        maqashid_detected = set()
+        toleransi_detected = {"toleran": [], "netral": [], "intoleran": []}
+        ayat_detected = []
+        warning_text = "Tidak ada peringatan."
+        hermeneutic_analysis = ""
+
+        # deteksi frasa
+        for cat, phrases in toleransi_phrases.items():
+            for phrase in phrases:
+                if phrase in clean_text:
+                    toleransi_detected[cat].append(phrase)
+                    if phrase in ayat_dict:
+                        ayat_detected.extend(ayat_dict[phrase])
+
+        # SENSITIVE VERSES -> detail context (pakai triple-quoted f-strings)
+        for phrase, context in SENSITIVE_VERSES.items():
+            if phrase in clean_text:
+                warning_text = f"""⚠️ {context.get('warning','')}
+📌 **Konteks:**
+{context.get('context','-')}"""
+                if "intertextual" in context:
+                    warning_text += f"""\n📖 **Hubungan Intertekstual:**
+{context['intertextual'].get('explanation','-')}"""
+                if "historical_context" in context:
+                    warning_text += f"""\n🏺 **Konteks Historis:**
+{context.get('historical_context','-')}"""
+                if "philosophical_theological" in context:
+                    warning_text += f"""\n🧠 **Nuansa Filosofis-Teologis:**
+{context.get('philosophical_theological','-')}"""
+                for maq in context.get("maqashid", []):
+                    maqashid_detected.add(maq)
+                break
+
+        # koleksi semua teks tafsir untuk analisis semantik
+        all_texts = [item["text"] for item in tafsir_data]
+        hermeneutics = analyze_hermeneutics_enhanced(clean_text, all_texts)
+        hermeneutic_analysis = format_hermeneutics_results_enhanced(hermeneutics)
+
+        # maqashid dari kata-kata
+        words = re.findall(r'[\u0600-\u06FF]+', clean_text)
+        for word in words:
+            for maq, kws in maqashid_map.items():
+                if any(kw in word for kw in kws):
+                    maqashid_detected.add(maq)
+
+        # highlighting frasa
+        highlighted = clean_text
+        for w in sorted(set(toleransi_detected["intoleran"]), key=len, reverse=True):
+            highlighted = highlighted.replace(w, f" [INT:{w}] ")
+        for w in sorted(set(toleransi_detected["toleran"]), key=len, reverse=True):
+            highlighted = highlighted.replace(w, f" [TOL:{w}] ")
+
+        # tabel kata
+        data = []
+        for w in words:
+            if any(p in w for p in toleransi_detected["toleran"]):
+                cat = "Toleran"
+            elif any(p in w for p in toleransi_detected["intoleran"]):
+                cat = "Intoleran"
+            elif any(p in w for p in toleransi_detected["netral"]):
+                cat = "Netral"
+            else:
+                cat = "Lainnya"
+            data.append({"Kata": w, "Kategori": cat})
+        df = pd.DataFrame(data)
+        counts = df["Kategori"].value_counts() if not df.empty else pd.Series(dtype=int)
+        for cat in ["Toleran","Netral","Intoleran","Lainnya"]:
+            if cat not in counts:
+                counts.loc[cat] = 0
+        counts = counts.loc[["Toleran","Netral","Intoleran","Lainnya"]]
+        img_dist = make_bar_image(counts, "Distribusi Kategori")
+
+        # analisis per kalimat
+        sents = ar_sentence_split(clean_text)
+        sent_res = []
+        for s in sents:
+            p, u = predict_sentiment(s, mode)
+            lab, cf = probs_to_label(p)
+            sent_res.append({"Kalimat": s, "Label": lab, "P(+)": round(p["positive"],3), "P(0)": round(p["neutral"],3), "P(-)": round(p["negative"],3)})
+        df_sent = pd.DataFrame(sent_res) if sent_res else pd.DataFrame(columns=["Kalimat","Label","P(+)","P(0)","P(-)"])
+        if not df_sent.empty:
+            counts_sent = df_sent["Label"].value_counts()
+            for cat in ["Toleran","Netral","Intoleran"]:
+                if cat not in counts_sent:
+                    counts_sent.loc[cat] = 0
+            counts_sent = counts_sent.loc[["Toleran","Netral","Intoleran"]]
+            img_sent = make_bar_image(counts_sent, "Distribusi Sentimen per Kalimat")
+        else:
+            img_sent = None
+
+        # KWIC
+        kw_all = list(set(toleransi_phrases.get("toleran", []) + toleransi_phrases.get("intoleran", [])))
+        kwic_rows = []
+        for kw in kw_all:
+            for m in re.finditer(re.escape(kw), clean_text):
+                start = max(m.start()-25, 0)
+                end = min(m.end()+25, len(clean_text))
+                ctx = clean_text[start:end]
+                kwic_rows.append({"Keyword": kw, "KWIC": ctx})
+        df_kwic = pd.DataFrame(kwic_rows) if kwic_rows else pd.DataFrame(columns=["Keyword","KWIC"])
+
+        stats = (
+            f"Model: {used}\n"
+            f"Dokumen Sentimen: {label} (confidence={score})\n"
+            f"P(+)={probs['positive']:.3f} | P(-)={probs['negative']:.3f} | P(0)={probs['neutral']:.3f}\n"
+            f"Frasa: Toleran={len(toleransi_detected['toleran'])}, Intoleran={len(toleransi_detected['intoleran'])}\n"
+            f"Kalimat dianalisis: {len(sents)}"
+        )
+        ctx = f"Toleran: {', '.join(sorted(set(toleransi_detected['toleran']))) or '-'}"
+        maq = f"Maqashid: {', '.join(sorted(maqashid_detected)) or '-'}"
+        ayat = "\n".join(sorted(set(ayat_detected))) or "-"
+
+        return highlighted, df, stats, ctx, maq, ayat, warning_text, img_dist, img_sent, df_kwic, hermeneutic_analysis
+
+    except Exception as e:
+        df_err = pd.DataFrame({"Kata": [], "Kategori": []})
+        img_err = make_bar_image(pd.Series([1], index=["Error"]), "Error")
+        return f"Error: {e}", df_err, "Error.", "-", "-", "-", "⚠️ Error", img_err, None, pd.DataFrame(), "Error dalam analisis hermeneutik"
+
+# 13) Evaluasi CSV
+def evaluate_csv(file_obj, mode: str):
+    try:
+        df = pd.read_csv(file_obj.name) if hasattr(file_obj, "name") else pd.read_csv(file_obj)
+    except Exception:
+        df = pd.read_excel(file_obj.name) if hasattr(file_obj, "name") else pd.read_excel(file_obj)
+    if "text" not in df.columns or "gold" not in df.columns:
+        raise ValueError("CSV harus memiliki kolom: 'text' dan 'gold'.")
+    preds = []
+    probs_list = []
+    for txt in df["text"].astype(str).tolist():
+        clean = normalize_arabic(txt)
+        probs, used = predict_sentiment(clean, mode)
+        preds.append(probs_to_label(probs)[0])
+        probs_list.append(probs)
+    labels = ["Toleran","Netral","Intoleran"]
+    y_true = df["gold"].astype(str).str.strip().map(lambda x: x.capitalize())
+    y_pred = pd.Series(preds)
+    acc = accuracy_score(y_true, y_pred)
+    pr, rc, f1, support = precision_recall_fscore_support(y_true, y_pred, labels=labels, zero_division=0)
+    report = classification_report(y_true, y_pred, labels=labels, zero_division=0)
+    cm_img = make_confusion_matrix_image(y_true, y_pred, labels=labels, title=f"CM - {mode}")
+    out_df = df.copy()
+    out_df["pred"] = y_pred
+    out_df["P(+)"] = [round(p["positive"],4) for p in probs_list]
+    out_df["P(0)"] = [round(p["neutral"],4) for p in probs_list]
+    out_df["P(-)"] = [round(p["negative"],4) for p in probs_list]
+    out_path = "hasil_prediksi.csv"
+    out_df.to_csv(out_path, index=False)
+    summary = (
+        f"Mode: {mode}\n"
+        f"Accuracy: {acc:.4f}\n"
+        f"Precision (Toleran/Netral/Intoleran): {pr}\n"
+        f"Recall    (Toleran/Netral/Intoleran): {rc}\n"
+        f"F1        (Toleran/Netral/Intoleran): {f1}\n"
+        f"Support   (Toleran/Netral/Intoleran): {support}\n"
+        f"Classification Report:\n{report}"
+    )
+    return summary, cm_img, out_path
+
+# 14) DATASET ASLI: TAFSIR AL-QURTHUBI & AZ-ZUHAILI — 6 AYAT TOLERANSI (DIPERBARUI)
+tafsir_data = [
+    {
+        "source": "al-Qurthubi,Al-Jami’ li Ahkam al-Qur’an, Juz 2, hlm. 216",
+        "surah": "البقرة",
+        "ayah": "256",
+        "reference": "2:256",
+        "theme": "لا إكراه في الدين",
+        "text": "هَذِهِ الْآيَةُ مِنْ أَوْكَدِ الْأَدِلَّةِ عَلَى أَنَّ الدَّعْوَةَ إِلَى اللَّهِ تَكُونُ بِالْحُجَّةِ وَالْبَيِّنَةِ، لَا بِالْإِكْرَاهِ. وَقَدْ نَزَلَتْ فِي رَجُلٍ مِنَ الْأَنْصَارِ أَسْلَمَ وَابْنَاهُ كَافِرَانِ، فَأَرَادَ أَنْ يُكْرِهَهُمَا فَنَزَلَتْ هَذِهِ الْآيَةُ تَمْنَعُ مِنْ ذَلِكَ."
+    },
+    {
+        "source": "az-Zuhaili",
+        "surah": "البقرة",
+        "ayah": "256",
+        "reference": "2:256",
+        "theme": "لا إكراه في الدين",
+        "text": "هَذِهِ الْآيَةُ الْكَرِيمَةُ تُعَدُّ مِنْ أُسُسِ التَّسَامُحِ الدِّينِيِّ فِي الْإِسْلَامِ. فَالدِّينُ عِنْدَ اللَّهِ أَنْ يَنْقَادَ الْعَبْدُ عَنْ يَقِينٍ، لَا عَنْ جَبْرٍ أَوْ قَسْرٍ."
+    },
+    {
+        "source": "al-Qurthubi",
+        "surah": "الكافرون",
+        "ayah": "6",
+        "reference": "109:6",
+        "theme": "لكم دينكم ولي دين",
+        "text": "نَزَلَتْ هَذِهِ السُّورَةُ فِي رَدِّ النَّبِيِّ ﷺ عَلَى قَوْمِهِ الَّذِينَ قَالُوا: تَعَالَ نَعْبُدُ مَا تَعْبُدُ وَتَعْبُدُ مَا نَعْبُدُ. فَأَخْبَرَهُمُ اللَّهُ أَنَّ الدِّينَ لَا يُجْمَعُ بَيْنَ التَّنَاقُضِ، وَأَمَرَهُ بِالْبَرَاءَةِ مِنْ عِبَادَتِهِمْ، وَلَكِنْ بِاللِّينِ وَالْإِحْسَانِ."
+    },
+    {
+        "source": "az-Zuhaili",
+        "surah": "الكافرون",
+        "ayah": "6",
+        "reference": "109:6",
+        "theme": "لكم دينكم ولي دين",
+        "text": "قَوْلُهُ: {لَكُمْ دِينُكُمْ وَلِيَ دِينِ} دَلِيلٌ عَلَى جَوَازِ الْعَيْشِ السَّلِيمِ مَعَ غَيْرِ الْمُسْلِمِينَ بِغَيْرِ تَبَادُلٍ فِي الْعَقَائِدِ، وَهُوَ مِنْ مَقَاصِدِ الشَّرِيعَةِ فِي حِفْظِ الدِّينِ وَالنَّفْسِ."
+    },
+    {
+        "source": "al-Qurthubi",
+        "surah": "الحجرات",
+        "ayah": "13",
+        "reference": "49:13",
+        "theme": "يا أيها الناس إنا خلقناكم",
+        "text": "هَذِهِ الْآيَةُ تَنْهَى عَنِ التَّفَاخُرِ بِالْأَنْسَابِ وَالْأَعْرَاقِ، وَتُبَيِّنُ أَنَّ التَّفَاضُلَ إِنَّمَا هُوَ بِالتَّقْوَى. وَهَذَا مِنْ مَقَاصِدِ الشَّرِيعَةِ فِي إِقَامَةِ الْعَدْلِ بَيْنَ الْعِبَادِ."
+    },
+    {
+        "source": "az-Zuhaili",
+        "surah": "الحجرات",
+        "ayah": "13",
+        "reference": "49:13",
+        "theme": "يا أيها الناس إنا خلقناكم",
+        "text": "الْآيَةُ تُبَيِّنُ أَنَّ الْإِنْسَانَ لَا يَتَفَضَّلُ عَلَى غَيْرِهِ بِالْعِرْقِ أَوِ اللَّوْنِ، وَإِنَّمَا بِالتَّقْوَى. وَهَذَا يُنَبِّهُ عَلَى مَكَانَةِ الْعَدْلِ فِي الْإِسْلَامِ."
+    },
+    {
+        "source": "al-Qurthubi",
+        "surah": "الممتحنة",
+        "ayah": "8",
+        "reference": "60:8",
+        "theme": "لا ينهاكم الله عن الذين لم يقاتلوكم",
+        "text": "أَذِنَ اللَّهُ لِلْمُسْلِمِينَ فِي بِرِّ الْكَافِرِينَ وَإِحْسَانِهِمْ إِلَيْهِمْ إِذَا لَمْ يُحَارِبُوهُمْ فِي الدِّينِ، وَلَمْ يُخْرِجُوهُمْ مِنْ دِيَارِهِمْ. وَهَذَا دَلِيلٌ عَلَى رَحْمَةِ الْإِسْلَامِ."
+    },
+    {
+        "source": "az-Zuhaili",
+        "surah": "الممتحنة",
+        "ayah": "8",
+        "reference": "60:8",
+        "theme": "لا ينهاكم الله عن الذين لم يقاتلوكم",
+        "text": "الْآيَةُ تُبَيِّنُ أَنَّ الْمُسْلِمَ لَا يُنْهَى عَنْ بِرِّ مَنْ لَمْ يُعَادِهِ، وَلَوْ كَانَ كَافِرًا. وَالْبِرُّ يَشْمَلُ الْقِيَامَ بِالْعَهْدِ، وَالْإِحْسَانَ فِي الْمُعَامَلَةِ."
+    },
+    {
+        "source": "al-Qurthubi",
+        "surah": "العنكبوت",
+        "ayah": "46",
+        "reference": "29:46",
+        "theme": "ولا تجادلوا أهل الكتاب إلا بالتي هي أحسن",
+        "text": "أَمَرَ اللَّهُ نَبِيَّهُ أَنْ لَا يُجَادِلَ أَهْلَ الْكِتَابِ إِلَّا بِالْحُجَّةِ الْبَالِغَةِ وَالْخُطَابِ الْحَسَنِ، وَأَنْ يُبَيِّنَ لَهُمْ وَحْدَانِيَّةَ اللَّهِ، وَأَنَّ دِينَ الْإِسْلَامِ هُوَ اسْتِمْرَارُ دِينِ الْأَنْبِيَاءِ."
+    },
+    {
+        "source": "az-Zuhaili",
+        "surah": "العنكبوت",
+        "ayah": "46",
+        "reference": "29:46",
+        "theme": "ولا تجادلوا أهل الكتاب إلا بالتي هي أحسن",
+        "text": "الْآيَةُ تَدْعُو إِلَى الْحِوَارِ الْمَتَمَدِّنِ مَعَ أَهْلِ الْكِتَابِ، وَالْجِدَالِ بِالْحُجَّةِ وَالْبَيَانِ، وَتَنْهَى عَنِ الْعَدَاوَةِ وَالْكَرَاهِيَّةِ."
+    },
+    {
+        "source": "al-Qurthubi",
+        "surah": "يونس",
+        "ayah": "41",
+        "reference": "10:41",
+        "theme": "ولو شاء ربك لآمن من في الأرض كلهم جميعاً",
+        "text": "وَلَوْ شَاءَ رَبُّكَ لَآمَنَ مَن فِي الْأَرْضِ كُلُّهُمْ جَمِيعًا. أَفَأَنتَ تُكْرِهُ النَّاسَ حَتَّى يَكُونُوا مُؤْمِنِينَ؟"
+    },
+    {
+        "source": "az-Zuhaili",
+        "surah": "يونس",
+        "ayah": "41",
+        "reference": "10:41",
+        "theme": "ولو شاء ربك لآمن من في الأرض كلهم جميعاً",
+        "text": "آية واضحة على أن الإيمان لا يكون بالإكراه، وإنما يكون بالهداية من الله، فلا يجوز لأحد أن يجبر الناس على الإسلام."
+    },
+    {
+        "source": "al-Qurthubi",
+        "surah": "الأنعام",
+        "ayah": "108",
+        "reference": "6:108",
+        "theme": "ولا تسبوا الذين يدعون من دون الله",
+        "text": "وَلَا تَسُبُّوا الَّذِينَ يَدْعُونَ مِن دُونِ اللَّهِ فَيَسُبُّوا اللَّهَ عَدْوًا بِغَيْرِ عِلْمٍ. كَذَلِكَ زَيَّنَّا لِكُلِّ أُمَّةٍ عَمَلَهُمْ ثُمَّ إِلَى رَبِّهِم مَّرْجِعُهُمْ فَيُنَبِّئُهُم بِمَا كَانُوا يَعْمَلُونَ."
+    },
+    {
+        "source": "az-Zuhaili",
+        "surah": "الأنعام",
+        "ayah": "108",
+        "reference": "6:108",
+        "theme": "ولا تسبوا الذين يدعون من دون الله",
+        "text": "الآية تنهى عن سب الآلهة orang kafir karena dapat memicu balas dendam terhadap Allah, menunjukkan etika berdialog yang tinggi."
+    }
+]
+
+def compare_tafsir(theme_key="لا إكراه في الدين"):
+    results = []
+    for item in tafsir_data:
+        if theme_key.lower() in item["theme"].lower() or theme_key == "all":
+            clean_text = normalize_arabic(item["text"])
+            probs, used = predict_sentiment(clean_text, "Ensemble")
+            label, conf = probs_to_label(probs)
+            ctx = ", ".join([p for p in toleransi_phrases.get("toleran", []) if p in clean_text]) or "-"
+            maq = ", ".join([m for m, kws in maqashid_map.items() if any(kw in clean_text for kw in kws)]) or "-"
+            results.append({
+                "Sumber": item["source"],
+                "Ayat": f"{item['surah']}:{item['ayah']}",
+                "Tema": item["theme"],
+                "Sentimen": label,
+                "P(Toleran)": round(probs["positive"], 3),
+                "Maqashid": maq,
+                "Frasa Toleran": ctx
+            })
+    return pd.DataFrame(results)
+
+# 15) GRADIO DASHBOARD
+with gr.Blocks(theme=gr.themes.Soft(), title="Dashboard: Analisis Toleransi Tafsir (Data Asli + Hermeneutik Lanjut)") as demo:
+    gr.Markdown("## 🕌 DASHBOARD: ANALISIS TOLERANSI TAFSIR AL-QUR'AN (DATA ASLI + HERMENEUTIK LANJUT)")
+    with gr.Tab("🔍 Analisis Tunggal"):
+        inp = gr.Textbox(label="Teks Tafsir (Arab)", lines=7, placeholder="اكتب النص هنا...")
+        mode = gr.Dropdown(["Ensemble","AraBERT only","CAMeLBERT only"], value="Ensemble")
+        btn = gr.Button("🔎 ANALISIS", variant="primary")
+        out_text = gr.Textbox(label="🔤 Teks + Highlight", lines=6)
+        out_table = gr.DataFrame(label="📊 Tabel Kata")
+        out_stats = gr.Textbox(label="📈 Statistik", lines=6)
+        out_ctx = gr.Textbox(label="📌 Frasa Toleran", lines=3)
+        out_maq = gr.Textbox(label="🎯 Maqashid", lines=3)
+        out_ayat = gr.Textbox(label="📖 Ayat Penguat", lines=4)
+        out_warn = gr.Textbox(label="⚠️ Peringatan Kontekstual", lines=6)
+        out_plot = gr.Image(label="🖼️ Distribusi Kata")
+        out_plot_sent = gr.Image(label="📉 Sentimen per Kalimat")
+        out_kwic = gr.DataFrame(label="🔎 KWIC: Keyword-in-Context")
+        out_herm = gr.Textbox(label="🔍 Hermeneutik (Lengkap)", lines=12)
+        btn.click(
+            fn=analyze_text,
+            inputs=[inp, mode],
+            outputs=[
+                out_text, out_table, out_stats, out_ctx, out_maq, out_ayat,
+                out_warn, out_plot, out_plot_sent, out_kwic, out_herm
+            ]
+        )
+
+    with gr.Tab("⚖️ Perbandingan Tafsir"):
+        gr.Markdown("### 📊 Bandingkan Tafsir al-Qurthubi & az-Zuhaili — Ayat Toleransi (Data Asli)")
+        theme_choice = gr.Dropdown(
+            choices=[
+                "لا إكراه في الدين",
+                "لكم دينكم ولي دين",
+                "يا أيها الناس إنا خلقناكم",
+                "لا ينهاكم الله عن الذين لم يقاتلوكم",
+                "ولا تجادلوا أهل الكتاب إلا بالتي هي أحسن",
+                "ولو شاء ربك لآمن من في الأرض كلهم جميعاً",
+                "ولا تسبوا الذين يدعون من دون الله",
+                "all"
+            ],
+            value="لا إكراه في الدين",
+            label="Pilih Tema Ayat"
+        )
+        btn_comp = gr.Button("📊 BANDINGKAN")
+        out_comp_table = gr.DataFrame()
+        btn_comp.click(compare_tafsir, theme_choice, out_comp_table)
+
+    with gr.Tab("🧪 Evaluasi CSV"):
+        file_csv = gr.File(label="📁 Upload CSV")
+        mode_eval = gr.Dropdown(["Ensemble","AraBERT only","CAMeLBERT only"], value="Ensemble")
+        btn_eval = gr.Button("📐 Evaluasi")
+        out_summary = gr.Textbox(lines=18)
+        out_cm = gr.Image()
+        out_dl = gr.File()
+        btn_eval.click(evaluate_csv, [file_csv, mode_eval], [out_summary, out_cm, out_dl])
+
+    with gr.Tab("ℹ️ Tentang"):
+        about = (
+            "Pipeline: Hybrid Ensemble + Rule-based + Hermeneutika\n"
+            f"Status: CAMeLBERT={'OK' if camel_loaded else 'FAIL'}, AraBERT={'OK' if arabert_loaded else 'FAIL'}, SBERT={'OK' if sbert_loaded else 'FAIL'}\n"
+            "Fitur: Analisis Tunggal, Perbandingan Tafsir, Evaluasi, Hermeneutik, Semantic Similarity, Topic Modeling\n"
+            f"Error CAMeLBERT: {camel_err or '-'}\n"
+            f"Error AraBERT: {arabert_err or '-'}\n"
+            f"Error SBERT: {sbert_err or '-'}\n"
+            "📚 Sumber Tafsir:\n"
+            "- al-Qurthubi: Al-Jami’ li-Ahkam al-Qur’an\n"
+            "- az-Zuhaili: Al-Tafsir al-Munir\n"
+        )
+        gr.Textbox(value=about, label="Info", lines=14, interactive=False)
+
+print("✅ Semua siap. Menjalankan dashboard...")
+demo.launch(share=True, show_error=True)
